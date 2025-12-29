@@ -1,0 +1,187 @@
+import os
+import json
+from typing import Dict, Callable, Awaitable, Any
+from redis import asyncio as aioredis
+import asyncio
+import logging
+
+logging.basicConfig(
+    level=logging.DEBUG if __name__ == "__main__" else logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+logger = logging.getLogger(__name__)
+
+class RedisClient:
+    """Shared Redis client for inter-process communication"""
+    def __init__(self, loop = None):
+        self.__host = os.getenv('REDIS_HOST', 'localhost')
+        self.__port = int(os.getenv('REDIS_PORT', 6379))
+        self.__username = os.getenv('REDIS_USERNAME', None)
+        self.__password = os.getenv('REDIS_PASSWORD', None)
+        self.__loop = loop or asyncio.get_event_loop()
+        
+        self.client: aioredis.Redis | None = None
+        self.listeners: Dict[str, Callable[[Any], Awaitable[None]]] = {}
+
+    async def connect(self):
+        """Connect to Redis server and setup pub/sub listeners"""
+        try:
+            self.client = aioredis.Redis(
+                host=self.__host,
+                port=self.__port,
+                username=self.__username,
+                password=self.__password,
+                db=0,
+                decode_responses=True,
+                socket_connect_timeout=15,
+                socket_keepalive=True,
+                health_check_interval=30
+            )
+            await self.client.ping()
+            logger.info(f"[RedisClient] Connected to Redis at {self.__host}:{self.__port}")
+        except Exception as e:
+            logger.error(f"[RedisClient] Failed to connect to Redis: {e}")
+            raise
+
+        # setup listeners
+        if self.listeners:
+            pubsub = self.client.pubsub()
+            for channel, callback in self.listeners.items():
+                await pubsub.subscribe(channel)
+                logger.info(f"[RedisClient] Subscribed to channel '{channel}'")
+
+            async def listener_loop():
+                async for message in pubsub.listen():
+                    if message['type'] == 'message':
+                        channel = message['channel']
+                        # data = json.loads(message['data'])
+                        data = message['data']
+
+                        try:
+                            data = json.loads(data)
+                        except json.JSONDecodeError:
+                            pass
+
+                        callback = self.listeners.get(channel, None)
+                        if callback:
+                            await callback(data)
+                            logging.debug(f"[RedisClient] Message received on channel '{channel}': {data}")
+
+            self.__loop.create_task(listener_loop())
+
+    async def send_heartbeat(self, heartbeat_data):
+        """
+        Send heartbeat to supervisor
+        
+        Args:
+            heartbeat_data: Dictionary containing worker status
+        """
+        await self.client.publish('worker:heartbeat', json.dumps(heartbeat_data))
+        logging.debug(f"[RedisClient] Heartbeat sent: {heartbeat_data}")
+    
+    async def close(self):
+        """Close Redis connection"""
+        if self.client:
+            await self.client.aclose()
+            logger.info("[RedisClient] Connection closed")
+
+    def add_listener(self, channel: str, callback: Callable[[Any], Awaitable[None]]):
+        """
+        Add a listener for a specific Redis channel
+        This only registers the listener if ran before connecting to Redis.
+
+        Args:
+            channel: Channel name to subscribe to
+            callback: Async function to call when a message is received
+        """
+        if channel in self.listeners:
+            logger.error(f"[RedisClient] Listener for channel '{channel}' already exists")
+            return
+
+        self.listeners[channel] = callback
+
+    def remove_listener(self, channel: str):
+        """
+        Remove a listener for a specific Redis channel
+
+        Args:
+            channel: Channel name to unsubscribe from
+        """
+        if channel in self.listeners:
+            del self.listeners[channel]
+
+    def listen(self, channel: str):
+        """
+        Decorator to register a listener for a specific Redis channel
+        
+        Args:
+            channel: Channel name to subscribe to
+        """
+        def decorator(func: Callable[[Any], Awaitable[None]]):
+            self.add_listener(channel, func)
+            return func
+        return decorator
+    
+    async def publish(self, channel: str, message: dict):
+        """
+        Publish a message to a specific Redis channel
+
+        Args:
+            channel: Channel name to publish to
+            message: Message dictionary to send
+        """
+        if not self.client:
+            raise RuntimeError("Redis client is not connected")
+
+        await self.client.publish(channel, json.dumps(message))
+        logger.debug(f"[RedisClient] Published message to channel '{channel}': {message}")
+
+    async def heartbeat(self, worker_id: str, status: str):
+        """
+        Send a heartbeat message for a specific worker
+
+        Args:
+            worker_id: Unique identifier for the worker
+            status: Current status of the worker
+        """
+        heartbeat_data = {
+            'worker_id': worker_id,
+            'status': status,
+            'timestamp': asyncio.get_event_loop().time()
+        }
+        await self.send_heartbeat(heartbeat_data)
+
+# for testing purposes
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    db = RedisClient(loop = loop)
+
+    @db.listen('test_channel')
+    async def handle_test_message(message):
+        print(f"Received message on test_channel: {message}")
+        print(type(message))
+    
+    async def test_redis_client():
+        await db.connect()
+        await db.client.set('test_key', 'test_value')
+        value = await db.client.get('test_key')
+        print(f"Retrieved from Redis: {value}")
+
+        await db.publish('test_channel', {'foo': 'bar', 'number': 42})
+        # await db.close()
+
+    loop.create_task(test_redis_client())
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
