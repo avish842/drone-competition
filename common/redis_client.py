@@ -88,6 +88,16 @@ class RedisClient:
                         await asyncio.sleep(2)  # wait before retrying
 
             self.__loop.create_task(listener_loop())
+
+    async def get_startup_mode(self) -> str:
+        """Retrieve the startup mode from Redis"""
+        if not self.client:
+            raise RuntimeError("Redis client is not connected")
+
+        mode = await self.client.get(f"startup_mode:{self.worker_id}")
+        if mode is None:
+            return "normal"  # default mode
+        return mode
     
     async def close(self):
         """Close Redis connection"""
